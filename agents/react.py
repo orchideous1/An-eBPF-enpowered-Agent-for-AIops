@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Dict
 
 from pydantic import Field
 
@@ -18,7 +18,7 @@ class ReActAgent(BaseAgent, ABC):
     llm: Optional[LLM] = Field(default_factory=LLM)
     memory: Memory = Field(default_factory=Memory)
     state: AgentState = AgentState.IDLE
-    
+    results: Dict = Field(default_factory=dict)
 
     max_steps: int = 10
     current_step: int = 0
@@ -28,7 +28,7 @@ class ReActAgent(BaseAgent, ABC):
         """Process current state and decide next action"""
 
     @abstractmethod
-    async def act(self) -> str:
+    async def act(self) -> Dict:
         """Execute decided actions"""
 
     async def step(self) -> str:
@@ -36,4 +36,9 @@ class ReActAgent(BaseAgent, ABC):
         should_act = await self.think()
         if not should_act:
             return "Thinking complete - no action needed"
-        return await self.act()
+        self.results = await self.act()
+        return await self.answer()
+
+    @abstractmethod
+    async def answer(self) -> str:
+        """ Formulate format answer to user"""

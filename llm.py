@@ -1,3 +1,5 @@
+import math
+import tiktoken
 from typing import List, Dict, Optional, Callable, Any, Union
 from openai import (
     APIError,
@@ -23,6 +25,136 @@ from SREgent.schema import (
     ToolChoice,
 )
 
+
+class TokenCounter:
+    # Token constants
+    BASE_MESSAGE_TOKENS = 4
+    FORMAT_TOKENS = 2
+    LOW_DETAIL_IMAGE_TOKENS = 85
+    HIGH_DETAIL_TILE_TOKENS = 170
+
+    # Image processing constants
+    MAX_SIZE = 2048
+    HIGH_DETAIL_TARGET_SHORT_SIDE = 768
+    TILE_SIZE = 512
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def count_text(self, text: str) -> int:
+        """Calculate tokens for a text string"""
+        return 0 if not text else len(self.tokenizer.encode(text))
+
+    def count_image(self, image_item: dict) -> int:
+        """
+        Calculate tokens for an image based on detail level and dimensions
+
+        For "low" detail: fixed 85 tokens
+        For "high" detail:
+        1. Scale to fit in 2048x2048 square
+        2. Scale shortest side to 768px
+        3. Count 512px tiles (170 tokens each)
+        4. Add 85 tokens
+        """
+        detail = image_item.get("detail", "medium")
+
+        # For low detail, always return fixed token count
+        if detail == "low":
+            return self.LOW_DETAIL_IMAGE_TOKENS
+
+        # For medium detail (default in OpenAI), use high detail calculation
+        # OpenAI doesn't specify a separate calculation for medium
+
+        # For high detail, calculate based on dimensions if available
+        if detail == "high" or detail == "medium":
+            # If dimensions are provided in the image_item
+            if "dimensions" in image_item:
+                width, height = image_item["dimensions"]
+                return self._calculate_high_detail_tokens(width, height)
+
+        return (
+            self._calculate_high_detail_tokens(1024, 1024) if detail == "high" else 1024
+        )
+
+    def _calculate_high_detail_tokens(self, width: int, height: int) -> int:
+        """Calculate tokens for high detail images based on dimensions"""
+        # Step 1: Scale to fit in MAX_SIZE x MAX_SIZE square
+        if width > self.MAX_SIZE or height > self.MAX_SIZE:
+            scale = self.MAX_SIZE / max(width, height)
+            width = int(width * scale)
+            height = int(height * scale)
+
+        # Step 2: Scale so shortest side is HIGH_DETAIL_TARGET_SHORT_SIDE
+        scale = self.HIGH_DETAIL_TARGET_SHORT_SIDE / min(width, height)
+        scaled_width = int(width * scale)
+        scaled_height = int(height * scale)
+
+        # Step 3: Count number of 512px tiles
+        tiles_x = math.ceil(scaled_width / self.TILE_SIZE)
+        tiles_y = math.ceil(scaled_height / self.TILE_SIZE)
+        total_tiles = tiles_x * tiles_y
+
+        # Step 4: Calculate final token count
+        return (
+            total_tiles * self.HIGH_DETAIL_TILE_TOKENS
+        ) + self.LOW_DETAIL_IMAGE_TOKENS
+
+    def count_content(self, content: Union[str, List[Union[str, dict]]]) -> int:
+        """Calculate tokens for message content"""
+        if not content:
+            return 0
+
+        if isinstance(content, str):
+            return self.count_text(content)
+
+        token_count = 0
+        for item in content:
+            if isinstance(item, str):
+                token_count += self.count_text(item)
+            elif isinstance(item, dict):
+                if "text" in item:
+                    token_count += self.count_text(item["text"])
+                elif "image_url" in item:
+                    token_count += self.count_image(item)
+        return token_count
+
+    def count_tool_calls(self, tool_calls: List[dict]) -> int:
+        """Calculate tokens for tool calls"""
+        token_count = 0
+        for tool_call in tool_calls:
+            if "function" in tool_call:
+                function = tool_call["function"]
+                token_count += self.count_text(function.get("name", ""))
+                token_count += self.count_text(function.get("arguments", ""))
+        return token_count
+
+    def count_message_tokens(self, messages: List[dict]) -> int:
+        """Calculate the total number of tokens in a message list"""
+        total_tokens = self.FORMAT_TOKENS  # Base format tokens
+
+        for message in messages:
+            tokens = self.BASE_MESSAGE_TOKENS  # Base tokens per message
+
+            # Add role tokens
+            tokens += self.count_text(message.get("role", ""))
+
+            # Add content tokens
+            if "content" in message:
+                tokens += self.count_content(message["content"])
+
+            # Add tool calls tokens
+            if "tool_calls" in message:
+                tokens += self.count_tool_calls(message["tool_calls"])
+
+            # Add name and tool_call_id tokens
+            tokens += self.count_text(message.get("name", ""))
+            tokens += self.count_text(message.get("tool_call_id", ""))
+
+            total_tokens += tokens
+
+        return total_tokens
+
+
 class LLM:
     def __init__(self):
         self.base_url = LLM_DEFAULT_CONFIG["OPENAI_BASE_URL"]
@@ -35,11 +167,29 @@ class LLM:
         if not self.api_key:
             raise ValueError("API key must be provided either as argument or environment variable.")
 
+        # Initialize tokenizer
+        try:
+            self.tokenizer = tiktoken.encoding_for_model(self.model)
+        except KeyError:
+            # If the model is not in tiktoken's presets, use cl100k_base as default
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        
+        self.token_counter = TokenCounter(self.tokenizer)
+
         # 使用新版 OpenAI 客户端
         self.client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url
         )
+
+    def count_tokens(self, text: str) -> int:
+        """Calculate the number of tokens in a text"""
+        if not text:
+            return 0
+        return len(self.tokenizer.encode(text))
+
+    def count_message_tokens(self, messages: List[dict]) -> int:
+        return self.token_counter.count_message_tokens(messages)
         
 
     @staticmethod
@@ -89,6 +239,9 @@ class LLM:
             else:
                 messages = self.format_messages(messages)
 
+            # Calculate input token count
+            input_tokens = self.count_message_tokens(messages)
+
             # 准备 API 调用参数
             params = {
                 "model": self.model,
@@ -103,7 +256,16 @@ class LLM:
                 response = await self.client.chat.completions.create(**params, stream=False)
                 if not response.choices or not response.choices[0].message.content:
                     raise ValueError("Empty or invalid response from LLM")
-                return response.choices[0].message.content
+                
+                content = response.choices[0].message.content
+                
+                if response.usage:
+                    logger.info(f"Token usage: Input={response.usage.prompt_tokens}, Completion={response.usage.completion_tokens}, Total={response.usage.total_tokens}")
+                else:
+                    completion_tokens = self.count_tokens(content)
+                    logger.info(f"Token usage: Input={input_tokens}, Completion={completion_tokens}, Total={input_tokens + completion_tokens}")
+                
+                return content
 
             response = await self.client.chat.completions.create(**params, stream=True)
             collected_messages = []
@@ -117,6 +279,9 @@ class LLM:
             full_response = "".join(collected_messages).strip()
             if not full_response:
                 raise ValueError("Empty response from streaming LLM")
+
+            completion_tokens = self.count_tokens(full_response)
+            logger.info(f"Token usage: Input={input_tokens}, Completion={completion_tokens}, Total={input_tokens + completion_tokens}")
 
             return full_response
 
@@ -187,6 +352,16 @@ class LLM:
             else:
                 messages = self.format_messages(messages)
 
+            # Calculate input token count
+            input_tokens = self.count_message_tokens(messages)
+
+            # If there are tools, calculate token count for tool descriptions
+            tools_tokens = 0
+            if tools:
+                for tool in tools:
+                    tools_tokens += self.count_tokens(str(tool))
+
+            input_tokens += tools_tokens
 
             # Validate tools if provided
             if tools:
@@ -219,6 +394,15 @@ class LLM:
                 print(response)
                 # raise ValueError("Invalid or empty response from LLM")
                 return None
+            
+            if response.usage:
+                logger.info(f"Token usage: Input={response.usage.prompt_tokens}, Completion={response.usage.completion_tokens}, Total={response.usage.total_tokens}")
+            else:
+                # Fallback if usage is not available
+                completion_tokens = 0 # Hard to estimate for tool calls without content
+                if response.choices[0].message.content:
+                    completion_tokens = self.count_tokens(response.choices[0].message.content)
+                logger.info(f"Token usage: Input={input_tokens}, Completion={completion_tokens}, Total={input_tokens + completion_tokens}")
 
             return response.choices[0].message
 

@@ -31,7 +31,7 @@ class ToolCallAgent(ReActAgent):
     special_tool_names: List[str] = Field(default_factory=lambda: [Terminate().name])
 
     tool_calls: List[ToolCall] = Field(default_factory=list)
-    self.results = None
+    results: Dict = Field(default_factory=dict)
     # _current_base64_image: Optional[str] = None
 
     # max_steps: int = 30
@@ -185,6 +185,29 @@ class ToolCallAgent(ReActAgent):
 
         return self.results
 
+    async def answer(self) -> str:
+        if not self.results:
+            return ""
+
+        reasoning = self.results.get("reasoning", "")
+        tool_use = self.results.get("tool_use", [])
+        result = self.results.get("result")
+
+        # If no tools were used, return reasoning
+        if len(tool_use) == 0:
+            return reasoning
+
+        # Check if any special tool (Terminate) or AskUser was used
+        for tool_name in tool_use:
+            name_lower = tool_name.lower()
+            is_special = any(t.lower() == name_lower for t in self.special_tool_names)
+            
+            if is_special or name_lower == "ask_user":
+                return str(result) if result else reasoning
+
+        # For intermediate steps, return empty string (will be filtered in run)
+        return ""
+
     async def execute_tool(self, command: ToolCall) -> str:
         """Execute a single tool call with robust error handling"""
         if not command or not command.function or not command.function.name:
@@ -283,6 +306,7 @@ class ToolCallAgent(ReActAgent):
         """Run the agent with cleanup when done."""
         try:
             async for output in super().run(request):
-                yield output
+                if output:
+                    yield output
         finally:
             await self.cleanup()

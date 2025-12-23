@@ -114,14 +114,15 @@ class BaseAgent(BaseModel, ABC):
 
     async def run(
         self, request: Optional[str] = None
-    ) -> AsyncGenerator[Dict[str, Any], str]:
+    ) -> AsyncGenerator[str, str]:
         """Execute the agent's main loop asynchronously.
 
         Args:
             request: Optional initial user request to process.
 
         Yields:
-            Dict[str, Any]: Events during execution (log, step_result, interaction, finish).
+            str
+            # Dict[str, Any]: Events during execution (log, step_result, interaction, finish).
 
         Raises:
             RuntimeError: If the agent is not in IDLE state at start.
@@ -164,6 +165,8 @@ class BaseAgent(BaseModel, ABC):
                         self.state = AgentState.IDLE
                         
                         break
+                
+                yield step_result
 
 
             if self.current_step >= self.max_steps:
@@ -173,11 +176,12 @@ class BaseAgent(BaseModel, ABC):
                 # yield  f"Terminated: Reached max steps ({self.max_steps})",
                 
             elif self.state == AgentState.FINISHED:
+                # yield "Agent finished execution."
                 logger.info("Agent finished execution.")
         # await SANDBOX_CLIENT.cleanup()
 
     @abstractmethod
-    async def step(self) -> Dict:
+    async def step(self) -> str:
         """Execute a single step in the agent's workflow.
 
         Must be implemented by subclasses to define specific behavior.
