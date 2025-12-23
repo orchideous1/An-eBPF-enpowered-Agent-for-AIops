@@ -1,13 +1,13 @@
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-from llm import LLM
-from logger import logger
+from SREgent.llm import LLM
+from SREgent.logger import logger
 # from sandbox.client import SANDBOX_CLIENT
-from schema import ROLE_TYPE, AgentState, Memory, Message
+from SREgent.schema import ROLE_TYPE, AgentState, Memory, Message
 
 
 class BaseAgent(BaseModel, ABC):
@@ -40,7 +40,7 @@ class BaseAgent(BaseModel, ABC):
     max_steps: int = Field(default=10, description="Maximum steps before termination")
     current_step: int = Field(default=0, description="Current step in execution")
 
-    duplicate_threshold: int = 2
+    duplicate_threshold: int = 1
 
     class Config:
         arbitrary_types_allowed = True
@@ -112,14 +112,16 @@ class BaseAgent(BaseModel, ABC):
         kwargs = {**(kwargs if role == "tool" else {})}
         self.memory.add_message(message_map[role](content, **kwargs))
 
-    async def run(self, request: Optional[str] = None) -> str:
+    async def run(
+        self, request: Optional[str] = None
+    ) -> AsyncGenerator[Dict[str, Any], str]:
         """Execute the agent's main loop asynchronously.
 
         Args:
             request: Optional initial user request to process.
 
-        Returns:
-            A string summarizing the execution results.
+        Yields:
+            Dict[str, Any]: Events during execution (log, step_result, interaction, finish).
 
         Raises:
             RuntimeError: If the agent is not in IDLE state at start.
@@ -130,7 +132,7 @@ class BaseAgent(BaseModel, ABC):
         if request:
             self.update_memory("user", request)
 
-        results: List[str] = []
+        stuck_threshold = 2
         async with self.state_context(AgentState.RUNNING):
             while (
                 self.current_step < self.max_steps and self.state != AgentState.FINISHED
@@ -139,21 +141,43 @@ class BaseAgent(BaseModel, ABC):
                 logger.info(f"Executing step {self.current_step}/{self.max_steps}")
                 step_result = await self.step()
 
+                # Handle User Interaction (User as a Tool)
+                if self.state == AgentState.AWAITING_INPUT:
+                    user_response = yield step_result
+                    
+
+                    # Update memory with user response
+                    if user_response:
+                        self.update_memory("user", user_response)
+
+                    # Reset state to RUNNING to continue execution
+                    self.state = AgentState.RUNNING
+                    continue
+
                 # Check for stuck state
                 if self.is_stuck():
                     self.handle_stuck_state()
+                    stuck_threshold -= 1
+                    if stuck_threshold <= 0:
+                        logger.warning(f"Agent detected stuck state. Terminate.")
+                        self.current_step = 0
+                        self.state = AgentState.IDLE
+                        
+                        break
 
-                results.append(f"Step {self.current_step}: {step_result}")
 
             if self.current_step >= self.max_steps:
                 self.current_step = 0
                 self.state = AgentState.IDLE
-                results.append(f"Terminated: Reached max steps ({self.max_steps})")
+                logger.warning(f"Terminated: Reached max steps ({self.max_steps})")
+                # yield  f"Terminated: Reached max steps ({self.max_steps})",
+                
+            elif self.state == AgentState.FINISHED:
+                logger.info("Agent finished execution.")
         # await SANDBOX_CLIENT.cleanup()
-        return "\n".join(results) if results else "No steps executed"
 
     @abstractmethod
-    async def step(self) -> str:
+    async def step(self) -> Dict:
         """Execute a single step in the agent's workflow.
 
         Must be implemented by subclasses to define specific behavior.

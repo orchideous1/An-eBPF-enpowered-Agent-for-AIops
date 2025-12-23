@@ -1,17 +1,18 @@
 import asyncio
 import json
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Union, AsyncGenerator, Dict
 
 from pydantic import Field
 
-from SREgent.agent.react import ReActAgent
+from SREgent.agents.react import ReActAgent
 from SREgent.logger import logger
 from SREgent.config import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from SREgent.schema import TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoice
-from SREgent.tool import CreateChatCompletion, Terminate, ToolCollection
+from SREgent.tool import CreateChatCompletion, Terminate, ToolCollection, AskUser
 
 
 TOOL_CALL_REQUIRED = "Tool calls required but none provided"
+
 
 
 class ToolCallAgent(ReActAgent):
@@ -24,16 +25,32 @@ class ToolCallAgent(ReActAgent):
     next_step_prompt: str = NEXT_STEP_PROMPT
 
     available_tools: ToolCollection = ToolCollection(
-        CreateChatCompletion(), Terminate()
+        CreateChatCompletion(), Terminate(), AskUser()
     )
     tool_choices: TOOL_CHOICE_TYPE = ToolChoice.AUTO  # type: ignore
     special_tool_names: List[str] = Field(default_factory=lambda: [Terminate().name])
 
     tool_calls: List[ToolCall] = Field(default_factory=list)
-    _current_base64_image: Optional[str] = None
+    self.results = None
+    # _current_base64_image: Optional[str] = None
 
-    max_steps: int = 30
-    max_observe: Optional[Union[int, bool]] = None
+    # max_steps: int = 30
+
+    @staticmethod
+    def _clean_args(raw_args: Optional[str]) -> str:
+        """Clean Markdown code blocks from arguments string"""
+        if not raw_args:
+            return "{}"
+        raw_args = raw_args.strip()
+        if raw_args.startswith("```"):
+            # Remove starting ```json or ```
+            parts = raw_args.split("\n", 1)
+            if len(parts) > 1:
+                raw_args = parts[1]
+            # Remove ending ```
+            if raw_args.strip().endswith("```"):
+                raw_args = raw_args.strip().rsplit("\n", 1)[0]
+        return raw_args
 
     async def think(self) -> bool:
         """Process current state and decide next actions using tools"""
@@ -74,7 +91,16 @@ class ToolCallAgent(ReActAgent):
         self.tool_calls = tool_calls = (
             response.tool_calls if response and response.tool_calls else []
         )
+        if len(tool_calls) > 1:
+            self.memory.add_message(
+                Message.assistant_message(
+                    "请你一次只调用一个工具"
+                )
+            )
+            return False
         content = response.content if response and response.content else ""
+        self.results = {'reasoning' : content}
+        self.results.update({'tool_use' : [call.function.name for call in tool_calls]})
 
         # Log response info
         logger.info(f"✨ {self.name}'s thoughts: {content}")
@@ -85,7 +111,13 @@ class ToolCallAgent(ReActAgent):
             logger.info(
                 f"🧰 Tools being prepared: {[call.function.name for call in tool_calls]}"
             )
-            logger.info(f"🔧 Tool arguments: {tool_calls[0].function.arguments}")
+            # Parse arguments
+            raw_args = tool_calls[0].function.arguments or "{}"
+            
+            # Use generic cleaning method
+            raw_args = self._clean_args(raw_args)
+            self.tool_calls[0].function.arguments = raw_args
+            logger.info(f"🔧 Tool arguments: {raw_args}")
 
         try:
             if response is None:
@@ -127,24 +159,16 @@ class ToolCallAgent(ReActAgent):
             )
             return False
 
-    async def act(self) -> str:
+    async def act(self) -> Dict:
         """Execute tool calls and handle their results"""
-        if not self.tool_calls:
-            if self.tool_choices == ToolChoice.REQUIRED:
-                raise ValueError(TOOL_CALL_REQUIRED)
 
-            # Return last message content if no tool calls
-            return self.messages[-1].content or "No content or commands to execute"
-
-        results = []
         for command in self.tool_calls:
             # Reset base64_image for each tool call
-            self._current_base64_image = None
+            # self._current_base64_image = None
 
             result = await self.execute_tool(command)
+            self.results.update({'result' : result})
 
-            if self.max_observe:
-                result = result[: self.max_observe]
 
             logger.info(
                 f"🎯 Tool '{command.function.name}' completed its mission! Result: {result}"
@@ -155,12 +179,11 @@ class ToolCallAgent(ReActAgent):
                 content=result,
                 tool_call_id=command.id,
                 name=command.function.name,
-                base64_image=self._current_base64_image,
+                # base64_image=self._current_base64_image,
             )
             self.memory.add_message(tool_msg)
-            results.append(result)
 
-        return "\n\n".join(results)
+        return self.results
 
     async def execute_tool(self, command: ToolCall) -> str:
         """Execute a single tool call with robust error handling"""
@@ -168,12 +191,27 @@ class ToolCallAgent(ReActAgent):
             return "Error: Invalid command format"
 
         name = command.function.name
+
+        # Clean arguments before parsing
+        cleaned_args = self._clean_args(command.function.arguments)
+
+        if name == "ask_user":
+            try:
+                args = json.loads(cleaned_args)
+                question = args.get("question", "")
+                logger.info(f"❓ Agent is asking user: {question}")
+                self.state = AgentState.AWAITING_INPUT
+                return f"ASK_USER_WAITING: {question}"
+            except Exception as e:
+                logger.error(f"Error parsing ask_user arguments: {e}")
+                return "Error: Invalid arguments for ask_user"
+
         if name not in self.available_tools.tool_map:
             return f"Error: Unknown tool '{name}'"
 
         try:
             # Parse arguments
-            args = json.loads(command.function.arguments or "{}")
+            args = json.loads(cleaned_args)
 
             # Execute the tool
             logger.info(f"🔧 Activating tool: '{name}'...")
@@ -182,10 +220,10 @@ class ToolCallAgent(ReActAgent):
             # Handle special tools
             await self._handle_special_tool(name=name, result=result)
 
-            # Check if result is a ToolResult with base64_image
-            if hasattr(result, "base64_image") and result.base64_image:
-                # Store the base64_image for later use in tool_message
-                self._current_base64_image = result.base64_image
+            # # Check if result is a ToolResult with base64_image
+            # if hasattr(result, "base64_image") and result.base64_image:
+            #     # Store the base64_image for later use in tool_message
+            #     self._current_base64_image = result.base64_image
 
             # Format result for display (standard case)
             observation = (
@@ -241,9 +279,10 @@ class ToolCallAgent(ReActAgent):
                     )
         logger.info(f"✨ Cleanup complete for agent '{self.name}'.")
 
-    async def run(self, request: Optional[str] = None) -> str:
+    async def run(self, request: Optional[str] = None) -> AsyncGenerator[str, str]:
         """Run the agent with cleanup when done."""
         try:
-            return await super().run(request)
+            async for output in super().run(request):
+                yield output
         finally:
             await self.cleanup()

@@ -1,0 +1,13 @@
+log/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+*.swp
+*.swo
+node_modules/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/

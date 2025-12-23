@@ -18,6 +18,7 @@ class ReActAgent(BaseAgent, ABC):
     llm: Optional[LLM] = Field(default_factory=LLM)
     memory: Memory = Field(default_factory=Memory)
     state: AgentState = AgentState.IDLE
+    
 
     max_steps: int = 10
     current_step: int = 0

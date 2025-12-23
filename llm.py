@@ -13,9 +13,9 @@ from tenacity import (
     stop_after_attempt,
     wait_random_exponential,
 )
-from config import LLM_DEFAULT_CONFIG, LLM_STEP_CONFIG, SystemPrompts
-from logger import logger
-from schema import (
+from SREgent.config import LLM_DEFAULT_CONFIG, LLM_STEP_CONFIG, SystemPrompts
+from SREgent.logger import logger
+from SREgent.schema import (
     ROLE_VALUES,
     TOOL_CHOICE_TYPE,
     TOOL_CHOICE_VALUES,
@@ -105,10 +105,10 @@ class LLM:
                     raise ValueError("Empty or invalid response from LLM")
                 return response.choices[0].message.content
 
-            response = self.client.chat.completions.create(**params, stream=True)
+            response = await self.client.chat.completions.create(**params, stream=True)
             collected_messages = []
             completion_text = ""
-            for chunk in response:
+            async for chunk in response:
                 chunk_message = chunk.choices[0].delta.content or ""
                 collected_messages.append(chunk_message)
                 completion_text += chunk_message

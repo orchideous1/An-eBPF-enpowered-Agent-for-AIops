@@ -36,6 +36,7 @@ class AgentState(str, Enum):
     RUNNING = "RUNNING"
     FINISHED = "FINISHED"
     ERROR = "ERROR"
+    AWAITING_INPUT = "AWAITING_INPUT"
 
 
 class Function(BaseModel):
